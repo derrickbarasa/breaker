@@ -48,7 +48,8 @@ const MAX_STEP = 3;                    // ball moves at most this many px per ph
 const KEY_SPEED = 560;                 // paddle speed on keyboard, px/s
 const MAX_ROWS = 12;
 const DROP_CHANCE = 0.1;               // chance a broken brick drops a power-up
-const WIDE_TIME = 12, SLOW_TIME = 8;   // power-up durations, seconds
+const WIDE_TIME = 12, SLOW_TIME = 8, STICKY_TIME = 15;   // power-up durations, seconds
+const STICK_MAX = 4;                   // a caught ball lets go by itself after this long
 const HIGH_KEY = 'rebreak.highscore';
 
 const canvas = document.getElementById('game');
@@ -70,7 +71,8 @@ let time = 0, clearTimer = 0, overTime = 0;
 let shake = 0, freeze = 0, comboPulse = 0;
 let remaining = 0;
 let bricks = [], particles = [], texts = [], drops = [], balls = [];
-let wideTimer = 0, slowTimer = 0;
+let wideTimer = 0, slowTimer = 0, stickyTimer = 0;
+let totalBreakable = 1;               // bricks to clear this level; drives the music's intensity
 let ballSpeed = 350, levelName = '';
 let lossFlash = 0, introTime = 0;     // life-lost screen flash; seconds since the bricks started dropping in
 
@@ -88,7 +90,7 @@ function saveHigh() {
 
 // ---------- audio ----------
 const MUTE_KEY = 'rebreak.muted';
-let ac = null, master = null;
+let ac = null, master = null, musicBus = null;
 let muted = false;
 try { muted = localStorage.getItem(MUTE_KEY) === '1'; } catch (e) { /* storage unavailable */ }
 
@@ -102,6 +104,10 @@ function initAudio() {
   master.gain.value = muted ? 0 : 0.5;
   master.connect(comp);
   comp.connect(ac.destination);
+  musicBus = ac.createGain();
+  musicBus.gain.value = 0.6;
+  musicBus.connect(master);
+  startMusic();
 }
 function resumeAudio() { if (ac && ac.state === 'suspended') ac.resume(); }
 
@@ -124,7 +130,7 @@ function tone(o) {
   } else {
     osc.connect(g);
   }
-  g.connect(master);
+  g.connect(o.bus || master);
   osc.start(t0);
   osc.stop(t0 + dur + 0.03);
 }
@@ -184,12 +190,67 @@ const sfx = {
   }
 };
 
+// ---------- music ----------
+// A quiet generative loop in C major pentatonic, so it sits with the combo notes. Four 16-step phrases
+// over a C - A - G - A bass; the melody is fixed (seeded) so it repeats like a tune, and more of its
+// notes come in as the level empties.
+const MUSIC_STEP = 60 / 96 / 2;                // eighth notes at 96 bpm
+const MUSIC_BASS = [65.41, 55, 49, 55];
+const MELODY = (() => {
+  let seed = 11;
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const steps = [];
+  let idx = 6;
+  for (let s = 0; s < 64; s++) {
+    const move = Math.floor(rnd() * 5) - 2;     // small steps up or down the scale
+    idx = Math.max(2, Math.min(10, idx + move));
+    // strong beats always sound; the rest drop in as intensity rises
+    steps.push({ f: pentaFreq(idx), r: s % 4 === 0 ? 0 : rnd() });
+  }
+  return steps;
+})();
+const music = { timer: null, next: 0, step: 0 };
+
+function startMusic() {
+  if (music.timer || !ac) return;
+  music.next = ac.currentTime + 0.15;
+  music.timer = setInterval(scheduleMusic, 60);
+}
+
+function scheduleMusic() {
+  if (!ac || ac.state !== 'running') return;     // suspended while paused
+  if (muted || paused || state === 'over') {     // keep the clock moving so it doesn't burst when it resumes
+    music.next = Math.max(music.next, ac.currentTime + 0.05);
+    return;
+  }
+  while (music.next < ac.currentTime + 0.25) {
+    playMusicStep(music.next, music.step);
+    music.next += MUSIC_STEP;
+    music.step = (music.step + 1) % 64;
+  }
+}
+
+function playMusicStep(t, s) {
+  const phrase = s >> 4, k = s & 15;
+  const delay = Math.max(0, t - ac.currentTime);
+  if (k === 0 || k === 8) {
+    tone({ f: MUSIC_BASS[phrase], type: 'sine', dur: k === 0 ? 1.1 : 0.7, vol: 0.14, delay, bus: musicBus });
+  }
+  const intensity = 1 - remaining / Math.max(1, totalBreakable);
+  const note = MELODY[s];
+  if (note.r < 0.35 + 0.4 * intensity) {
+    tone({ f: note.f, type: 'triangle', dur: 0.4, vol: 0.09, delay, lp: 1800, bus: musicBus });
+  }
+}
+
 // ---------- level ----------
 const COLS = 10, GAP = 4, BH = 18;
 const BW = (W - 40 - GAP * (COLS - 1)) / COLS;
 const GRID_Y = 100;
 const BOMB_COLOR = '#ff8a2b', STEEL_COLOR = '#6e6a9c';
 const MAX_BALLS = 6;
+const POWER_LABELS = { wide: 'WIDE!', slow: 'SLOW!', multi: 'MULTIBALL!', sticky: 'STICKY!' };
+const POWER_LETTERS = { wide: 'W', slow: 'S', multi: 'M', sticky: 'C' };
 const CALLOUTS = { 5: 'NICE!', 10: 'GREAT!', 20: 'UNREAL!' };   // shown when the combo reaches these counts
 
 // '#' brick, 'X' explosive, 'U' unbreakable, '.' empty. Levels cycle through these.
@@ -252,12 +313,14 @@ function buildLevel() {
     }
   });
   levelName = layout.name;
+  totalBreakable = remaining;
   introTime = 0;
 }
 
 function levelSpeed() { return Math.min(780, 350 * (1 + 0.08 * (level - 1))); }
 
-function newBall(x, y, vx, vy) { return { x, y, vx: vx || 0, vy: vy || 0, trail: [] }; }
+// stuck: null while flying, otherwise where on the paddle it was caught (-1..1)
+function newBall(x, y, vx, vy) { return { x, y, vx: vx || 0, vy: vy || 0, trail: [], stuck: null, stuckTime: 0 }; }
 
 function applySpeed() {
   ballSpeed = levelSpeed() * (slowTimer > 0 ? 0.7 : 1);
@@ -266,7 +329,7 @@ function applySpeed() {
 
 function resetBall() {
   state = 'serve';
-  wideTimer = slowTimer = 0;
+  wideTimer = slowTimer = stickyTimer = 0;
   drops.length = 0;
   balls = [newBall(paddle.x, PY - R)];
 }
@@ -281,8 +344,24 @@ function launch() {
   sfx.launch();
 }
 
+// let go of any caught balls, aimed by where they landed on the paddle
+function releaseStuck() {
+  let any = false;
+  for (const b of balls) {
+    if (b.stuck === null) continue;
+    const a = b.stuck * MAX_ANGLE;
+    b.vx = Math.sin(a) * ballSpeed;
+    b.vy = -Math.cos(a) * ballSpeed;
+    b.stuck = null;
+    any = true;
+  }
+  if (any) sfx.launch();
+  return any;
+}
+
 function multiBall() {
   for (const src of balls.slice()) {
+    if (src.stuck !== null) continue;
     for (const da of [-0.45, 0.45]) {
       if (balls.length >= MAX_BALLS) return;
       const a = Math.atan2(src.vy, src.vx) + da;
@@ -392,7 +471,7 @@ function collideBricks(ball) {
 
 function dropType() {
   const r = Math.random();
-  return r < 0.35 ? 'wide' : r < 0.75 ? 'multi' : 'slow';
+  return r < 0.25 ? 'wide' : r < 0.55 ? 'multi' : r < 0.78 ? 'sticky' : 'slow';
 }
 
 function awardBrick(b) {
@@ -473,6 +552,7 @@ function hitBrick(b, ball) {
 
 // returns true when the ball has fallen off the bottom
 function stepBall(ball, dt) {
+  if (ball.stuck !== null) return false;
   const dist = Math.hypot(ball.vx, ball.vy) * dt;
   const n = Math.max(1, Math.ceil(dist / MAX_STEP));
   const h = dt / n;
@@ -502,6 +582,13 @@ function stepBall(ball, dt) {
       paddle.sq = 1; paddle.sqv = 0;
       burst(ball.x, PY, CREAM, 5);
       sfx.paddle();
+      if (stickyTimer > 0) {                     // sticky paddle: hold the ball until the player lets go
+        ball.stuck = off;
+        ball.stuckTime = 0;
+        ball.vx = ball.vy = 0;
+        ball.trail.length = 0;
+        return false;
+      }
     }
 
     if (ball.y - R > H) return true;
@@ -539,6 +626,10 @@ function update(dt) {
     slowTimer = Math.max(0, slowTimer - dt);
     if (slowTimer === 0) applySpeed();
   }
+  if (stickyTimer > 0) {
+    stickyTimer = Math.max(0, stickyTimer - dt);
+    if (stickyTimer === 0) releaseStuck();
+  }
   const targetW = wideTimer > 0 ? PW * 1.5 : PW;
   paddle.w += (targetW - paddle.w) * Math.min(1, dt * 12);
   setPaddle(paddle.x);
@@ -548,11 +639,12 @@ function update(dt) {
     if (d.y + 7 >= PY && d.y - 7 <= PY + PH && Math.abs(d.x - paddle.x) <= paddle.w / 2 + 14) {
       if (d.type === 'wide') wideTimer = WIDE_TIME;
       else if (d.type === 'slow') slowTimer = SLOW_TIME;
+      else if (d.type === 'sticky') stickyTimer = STICKY_TIME;
       else if (state === 'play') multiBall();
       applySpeed();
       sfx.power();
       burst(d.x, PY, CREAM, 10);
-      addText(d.type === 'wide' ? 'WIDE!' : d.type === 'slow' ? 'SLOW!' : 'MULTIBALL!', paddle.x, PY - 24, CREAM, 3);
+      addText(POWER_LABELS[d.type], paddle.x, PY - 24, CREAM, 3);
       drops.splice(i, 1);
     } else if (d.y > H + 10) {
       drops.splice(i, 1);
@@ -579,6 +671,13 @@ function update(dt) {
   } else if (state === 'play') {
     for (let i = balls.length - 1; i >= 0; i--) {
       const b = balls[i];
+      if (b.stuck !== null) {                    // riding the paddle until released
+        b.stuckTime += dt;
+        b.x = Math.max(R, Math.min(W - R, paddle.x + b.stuck * (paddle.w / 2 + R * 0.6)));
+        b.y = PY - R;
+        if (b.stuckTime > STICK_MAX) releaseStuck();
+        continue;
+      }
       const lost = stepBall(b, dt);
       if (state !== 'play') break;               // the last brick went: the level is cleared
       if (lost) { balls.splice(i, 1); continue; }
@@ -714,12 +813,23 @@ function drawGame() {
     ctx.font = '10px ' + FONT;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillStyle = BG;
-    ctx.fillText(d.type === 'wide' ? 'W' : d.type === 'slow' ? 'S' : 'M', d.x, d.y + 1);
+    ctx.fillText(POWER_LETTERS[d.type], d.x, d.y + 1);
   }
 
   // ball + trail
   if (state === 'serve' || state === 'play') {
     for (const ball of balls) {
+      if (ball.stuck !== null) {                       // aim guide for a caught ball
+        const a = ball.stuck * MAX_ANGLE;
+        ctx.save();
+        ctx.setLineDash([4, 7]);
+        ctx.strokeStyle = 'rgba(255,243,214,0.55)'; ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(ball.x, ball.y - R - 4);
+        ctx.lineTo(ball.x + Math.sin(a) * 90, ball.y - R - 4 - Math.cos(a) * 90);
+        ctx.stroke();
+        ctx.restore();
+      }
       const tr = ball.trail;
       for (let i = 0; i < tr.length; i++) {
         const f = (i + 1) / tr.length;
@@ -743,7 +853,9 @@ function drawGame() {
     ctx.scale(1 + 0.28 * paddle.sq, 1 - 0.4 * paddle.sq);
     ctx.translate(0, -PH);
     ctx.fillStyle = CREAM;
+    if (stickyTimer > 0) { ctx.shadowColor = CREAM; ctx.shadowBlur = reduce ? 10 : 10 + 6 * Math.sin(time * 8); }
     rr(-paddle.w / 2, 0, paddle.w, PH, 7); ctx.fill();
+    ctx.shadowBlur = 0;
     ctx.fillStyle = 'rgba(255,255,255,0.55)';
     rr(-paddle.w / 2 + 5, 2, paddle.w - 10, 3, 1.5); ctx.fill();
     ctx.restore();
@@ -784,8 +896,14 @@ function drawHud() {
     text('COMBO x' + combo, W / 2, 80, s, CREAM);
   }
 
-  if (wideTimer > 0) text('WIDE ' + Math.ceil(wideTimer), W / 2 - 50, H - 20, 10, CREAM);
-  if (slowTimer > 0) text('SLOW ' + Math.ceil(slowTimer), W / 2 + 50, H - 20, 10, CREAM);
+  const active = [];
+  if (wideTimer > 0) active.push('WIDE ' + Math.ceil(wideTimer));
+  if (slowTimer > 0) active.push('SLOW ' + Math.ceil(slowTimer));
+  if (stickyTimer > 0) active.push('STICKY ' + Math.ceil(stickyTimer));
+  active.forEach((s, i) => text(s, W / 2 + (i - (active.length - 1) / 2) * 84, H - 20, 10, CREAM));
+  if (state === 'play' && balls.some(b => b.stuck !== null)) {
+    text('CLICK OR SPACE TO RELEASE', W / 2, PY - 52, 10, CREAM, 'center', blink());
+  }
 
   text('P: PAUSE   M: MUTE', 12, H - 20, 9, 'rgba(255,243,214,0.3)', 'left');
   drawButtons();
@@ -911,6 +1029,7 @@ function action() {
   initAudio(); resumeAudio();
   if (paused) { setPaused(false); return; }
   if (state === 'serve') launch();
+  else if (state === 'play') releaseStuck();
   else if (state === 'over' && time - overTime > 0.7) restart();
 }
 
